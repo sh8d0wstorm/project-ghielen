@@ -1,0 +1,1229 @@
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import {
+  addDoc,
+  collection,
+  deleteDoc,
+  doc,
+  getDocs,
+  getFirestore,
+  onSnapshot,
+  updateDoc
+} from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import {
+  getAuth,
+  signInWithEmailAndPassword,
+  signOut
+} from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+async function removeDuplicatePlaces() {
+  console.log("🧹 STARTING DUPLICATE CLEANUP...");
+
+  const snapshot = await getDocs(collection(db, "places"));
+
+  const seen = new Map();
+  const duplicates = [];
+
+  snapshot.forEach((documentSnapshot) => {
+    const data = documentSnapshot.data();
+
+    if (!data.name) return;
+
+    // Normalize the address so formatting differences don't create separate entries
+    const normalizedAddress = String(data.name)
+      .toLowerCase()
+      .trim()
+      .replace(/\s+/g, " ")
+      .replace(/\s*,\s*/g, ",")
+      .replace(/\s*-\s*/g, "-");
+
+    console.log(
+      "Checking:",
+      data.name,
+      "→",
+      normalizedAddress
+    );
+
+    if (seen.has(normalizedAddress)) {
+      duplicates.push(documentSnapshot.id);
+
+      console.log(
+        "🗑️ DUPLICATE FOUND:",
+        data.name,
+        "ID:",
+        documentSnapshot.id
+      );
+    } else {
+      seen.set(normalizedAddress, documentSnapshot.id);
+    }
+  });
+
+  console.log("📋 Firebase documents:", snapshot.size);
+  console.log("🗑️ Duplicates found:", duplicates.length);
+
+  // Delete duplicates
+  for (const duplicateId of duplicates) {
+    try {
+      await deleteDoc(doc(db, "places", duplicateId));
+      console.log("✅ Deleted duplicate:", duplicateId);
+    } catch (error) {
+      console.error(
+        "❌ Could not delete duplicate:",
+        duplicateId,
+        error
+      );
+    }
+  }
+
+  console.log("🎉 DUPLICATE CLEANUP FINISHED");
+}
+// ===== STATE =====
+let adminMode = false;   // true = admin features enabled
+let activePlace = null;  // currently selected place
+let markers = [];        // leaflet markers on map
+let isAdding = false;    // future: add-mode state
+let editingPlace = null; // currently edited place
+let places = [];
+let fuse; // declare first
+let isImporting = false; // prevent snapshot updates during import
+
+const photoFolderUrl = "file:///C:/Users/junoz/OneDrive%20-%20Ghielens/data/100%20jaar/aaa";
+
+// ===== DATA =====
+const firebaseConfig = {
+  apiKey: "AIzaSyDX-AIGkfhSEfBRDt-SRrJyVWRlmtxs7qE",
+  authDomain: "project-ghielens.firebaseapp.com",
+  projectId: "project-ghielens",
+  storageBucket: "project-ghielens.firebasestorage.app",
+  messagingSenderId: "720120279485",
+  appId: "1:720120279485:web:96b0791f6206dad21ea2d4"
+};
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app, "default");
+const auth = getAuth(app);
+const SUPABASE_URL = "https://ekhxcltruzmufagywohk.supabase.co";
+const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_CaBc-GUPScR3dWAtxRW5GQ_S2FfB6HW";
+const SUPABASE_BUCKET = "place-photos";
+const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
+  accessToken: async () => {
+    const user = auth.currentUser;
+    return user ? user.getIdToken() : null;
+  }
+});
+console.log(app.options.projectId, "Firestore database: default");
+function initFuse() {
+  fuse = new Fuse(places, {
+    keys: ["name", "keyword", "latString", "ingString"],
+    threshold: 0.4,
+    minMatchCharLength: 2
+  });
+}
+
+function normalizePlaceCoordinates(place) {
+  place.lat = parseCoord(place.lat);
+  place.ing = parseCoord(place.ing);
+
+  return place;
+}
+function parseCoord(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+
+  const cleaned = String(value)
+    .trim()
+    .replace(",", ".")
+    .replace(/[^0-9.-]/g, ""); // removes weird Excel junk
+
+  const num = Number(cleaned);
+
+  return Number.isFinite(num) ? num : null;
+}
+
+function getCoordinates(data) {
+  const lat = parseCoord(
+    data?.lat ?? data?.Lat ?? data?.latitude ?? data?.Latitude ?? data?.y ?? data?.Y
+  );
+  const ing = parseCoord(
+    data?.ing ?? data?.Ing ?? data?.lng ?? data?.Lng ?? data?.lon ?? data?.Lon ??
+      data?.longitude ?? data?.Longitude ?? data?.long ?? data?.Long ?? data?.x ?? data?.X
+  );
+
+  return { lat, ing };
+}
+
+function parseLatLngFromString(value) {
+
+  if (value === null || value === undefined) return null;
+
+  const text = String(value).trim();
+
+  const match =
+    text.match(/(-?\d+(?:[.,]\d+)?)\s*[,;/]\s*(-?\d+(?:[.,]\d+)?)/)
+    ||
+    text.match(/(-?\d+(?:[.,]\d+)?)\s+(-?\d+(?:[.,]\d+)?)/);
+
+  if (!match) return null;
+
+  const lat = parseFloat(match[1].replace(",", "."));
+  const ing = parseFloat(match[2].replace(",", "."));
+
+  // Reject values that cannot realistically be Belgian coordinates.
+  // This prevents house numbers such as "4, 78" from being treated
+  // as latitude/longitude.
+  if (lat < 49 || lat > 52 || ing < 2 || ing > 7) {
+    return null;
+  }
+
+  return {
+    lat,
+    ing
+  };
+}
+
+function extractLatLngFromRow(row) {
+  const lat = row?.lat ?? row?.Lat ?? row?.latitude ?? row?.Latitude ?? row?.y ?? row?.Y;
+  const ing = row?.ing ?? row?.Ing ?? row?.lng ?? row?.Lng ?? row?.lon ?? row?.Lon ??
+    row?.longitude ?? row?.Longitude ?? row?.long ?? row?.Long ?? row?.x ?? row?.X;
+
+  if (lat != null && ing != null) {
+    return { lat, ing };
+  }
+
+  const combined = row?.coordinates ?? row?.Coordinates ?? row?.coordinate ?? row?.Coordinate ??
+    row?.latlng ?? row?.LatLng ?? row?.["Lat/Lng"] ?? row?.location ?? row?.Location ??
+    row?.geo ?? row?.Geo ?? row?.coords ?? row?.Coords;
+
+  const parsed = parseLatLngFromString(combined);
+  if (parsed) {
+    return parsed;
+  }
+
+  for (const key in row) {
+    if (typeof row[key] === "string") {
+      const parsedField = parseLatLngFromString(row[key]);
+      if (parsedField) {
+        return parsedField;
+      }
+    }
+  }
+
+  return { lat: null, ing: null };
+}
+
+function loadPlaces() {
+  console.log("Loading places...");
+  console.log("🔥 loadPlaces() CALLED");
+  // FIX: Collection changed from "locations" to "places" to match your add/edit methods
+  onSnapshot(collection(db, "places"), (snapshot) => {
+    console.log("Snapshot size:", snapshot ? snapshot.size : 0);
+
+      if (isImporting) {
+        console.log("⏸️ Skipping render during Excel import");
+        return;
+      }
+
+      if (!snapshot || snapshot.size === 0) {
+        console.warn("No documents found in Firebase path! Check your collection name.");
+        initFuse();
+        renderPlaces(places);
+        return;
+      }
+
+      // Clear old markers only when we have new snapshot data
+      markers.forEach(marker => map.removeLayer(marker));
+      markers = [];
+
+      // Build firebasePlaces from snapshot
+      const firebasePlaces = snapshot.docs.map(doc => {
+      const data = doc.data();
+      
+      // Pull coordinates using your custom structural fallback function
+      const { lat, ing } = getCoordinates(data);
+
+      console.log("Firebase doc coordinates:", {
+        id: doc.id,
+        raw: data,
+        lat,
+        ing
+      });
+
+      const place = normalizePlaceCoordinates({
+        id: doc.id,
+        name: data.name || "Untitled",
+        lat,
+        ing,
+        description: data.description || "",
+        image: sanitizeImageArray(data.image || data.images || data.img || ""),
+        keyword: data.keyword || data.keywords || []
+      });
+
+      // Render Leaflet marker safely if coordinate data evaluates successfully
+      if (place.lat !== null && place.ing !== null) {
+          // Leaflet expects [latitude, longitude]
+        const marker = L.marker([place.lat, place.ing])
+  .addTo(map);
+
+place.marker = marker;
+
+marker.on("click", () => {
+  showDetails(place);
+});
+
+markers.push(marker);
+      } else {
+          console.warn(`Place ID ${doc.id} skipped: Invalid coordinates`, data);
+      }
+
+      return place;
+    });
+
+    // Replace places completely with Firebase data (no duplicates)
+    places = firebasePlaces
+      .sort((a, b) =>
+        String(a.name || "").localeCompare(
+          String(b.name || ""),
+          "nl",
+          { sensitivity: "base" }
+        )
+      );
+
+    console.log("✅ Loaded from Firebase. Total places:", places.length, places.map(p => p.name));
+
+    if (!fuse) initFuse(); else fuse.setCollection(places);
+    renderPlaces(places);
+  }, (err) => {
+    console.error("Firebase subscription error:", err);
+  });
+}
+
+// ===== MAP =====
+
+const map = L.map('map').setView([51.2194, 4.4025], 13);
+
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap contributors'
+}).addTo(map);
+
+map.on("click", function(e) {
+    if (!adminMode || !isAdding) return;
+
+    document.getElementById("m_lat").value = e.latlng.lat;
+    document.getElementById("m_ing").value = e.latlng.lng;
+    document.getElementById("addModal").style.display = "block";
+
+    isAdding = false;
+});
+
+let myLocationMarker = null;
+let myLocationCircle = null;
+let locationWatcher = null;
+
+// Red version of the original Leaflet pin
+const redLocationIcon = L.icon({
+    iconUrl: "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-red.png",
+    shadowUrl: "https://cdnjs.cloudflare.com/ajax/libs/leaflet/0.7.7/images/marker-shadow.png",
+    iconSize: [25, 41],
+    iconAnchor: [12, 41],
+    popupAnchor: [1, -34],
+    shadowSize: [41, 41]
+});
+
+document.getElementById("locateMe").addEventListener("click", function () {
+    if (!navigator.geolocation) {
+        alert("Your browser does not support location sharing.");
+        return;
+    }
+
+    if (locationWatcher !== null) {
+        navigator.geolocation.clearWatch(locationWatcher);
+    }
+
+    locationWatcher = navigator.geolocation.watchPosition(
+        function (position) {
+            const lat = position.coords.latitude;
+            const lng = position.coords.longitude;
+            const accuracy = position.coords.accuracy;
+            const location = [lat, lng];
+
+            const popupContent =
+                `You are here<br>Accuracy radius: ±${Math.round(accuracy)} metres`;
+
+            if (!myLocationMarker) {
+                myLocationMarker = L.marker(location, {
+                    icon: redLocationIcon
+                }).addTo(map);
+
+                myLocationMarker
+                    .bindPopup(popupContent)
+                    .openPopup();
+
+                myLocationCircle = L.circle(location, {
+                    radius: accuracy,
+                    color: "#d32f2f",
+                    fillColor: "#f44336",
+                    fillOpacity: 0.12
+                }).addTo(map);
+
+                map.setView(location, 16);
+            } else {
+                myLocationMarker.setLatLng(location);
+                myLocationMarker.setPopupContent(popupContent);
+
+                myLocationCircle.setLatLng(location);
+                myLocationCircle.setRadius(accuracy);
+            }
+        },
+        function (error) {
+            if (error.code === 1) {
+                alert("Please allow location access in your browser.");
+            } else if (error.code === 2) {
+                alert("Your location is currently unavailable.");
+            } else {
+                alert("Getting your location took too long. Please try again.");
+            }
+
+            if (locationWatcher !== null) {
+                navigator.geolocation.clearWatch(locationWatcher);
+                locationWatcher = null;
+            }
+        },
+        {
+            enableHighAccuracy: true,
+            maximumAge: 5000,
+            timeout: 15000
+        }
+    );
+});
+// ===== UI ELEMENTS =====
+const listContainer = document.getElementById("list");
+const detailsContainer = document.getElementById("details");
+const searchInput = document.getElementById("search");
+
+// ===== FUNCTIONS =====
+function normalizeImageList(value) {
+  if (!value) return [];
+
+  if (Array.isArray(value)) {
+    return value
+      .map(item => String(item).trim())
+      .filter(item => item !== "");
+  }
+
+  if (typeof value !== "string") {
+    return [String(value).trim()].filter(item => item !== "");
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) return [];
+
+  if ((trimmed.startsWith("[") && trimmed.endsWith("]")) || (trimmed.startsWith("{") && trimmed.endsWith("}"))) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        return parsed
+          .map(item => String(item).trim())
+          .filter(item => item !== "");
+      }
+    } catch (err) {
+      // ignore malformed JSON and fall through to string parsing below
+    }
+  }
+
+  return trimmed
+    .split(/\s*[\n;|]+\s*/)
+    .map(item => item.trim())
+    .filter(item => item !== "");
+}
+
+function sanitizeImageArray(value) {
+  const images = normalizeImageList(value);
+
+  return images.filter(image => {
+    if (!image || typeof image !== "string") return false;
+
+    const trimmed = image.trim();
+    if (!trimmed) return false;
+
+    const isHttpUrl = /^https?:\/\//i.test(trimmed);
+    const isDataUrl = /^data:/i.test(trimmed);
+    const isBlobUrl = /^blob:/i.test(trimmed);
+    const isRelativeAsset = trimmed.startsWith("images/") || trimmed.startsWith("./") || trimmed.startsWith("/");
+    const isLocalFileUrl = /^file:\/\//i.test(trimmed) || /^[a-zA-Z]:[\\/]/.test(trimmed);
+
+    if (isHttpUrl || isDataUrl || isBlobUrl || isRelativeAsset) {
+      return true;
+    }
+
+    if (isLocalFileUrl) {
+      console.warn("Ignoring local file URL in saved image data:", trimmed);
+      return false;
+    }
+
+    console.warn("Ignoring unsupported image value in saved image data:", trimmed);
+    return false;
+  });
+}
+
+function getImagesForPlace(place) {
+  if (!place) return [];
+
+  const rawImages = place.images || place.image || place.img || [];
+  const images = sanitizeImageArray(rawImages);
+
+  return images.filter(image => {
+    const trimmed = String(image).trim();
+    if (!trimmed) return false;
+
+    if (/^https?:\/\//i.test(trimmed) || /^data:/i.test(trimmed) || /^blob:/i.test(trimmed)) {
+      return true;
+    }
+
+    if (trimmed.startsWith("images/") || trimmed.startsWith("./") || trimmed.startsWith("/")) {
+      return true;
+    }
+
+    console.warn("Dropping invalid image reference before gallery render:", trimmed);
+    return false;
+  });
+}
+
+console.log("getImagesForPlace() function defined.");
+
+function buildGalleryHtml(imageUrls) {
+  if (!imageUrls || imageUrls.length === 0) return "";
+
+  const safeUrls = imageUrls.map(String);
+  const dots = safeUrls.map((url, index) => `
+    <button type="button" class="gallery-dot ${index === 0 ? "active" : ""}" data-index="${index}" data-url="${url}" aria-label="Go to image ${index + 1}"></button>
+  `).join("");
+
+  return `
+    <div class="image-gallery" data-current="0" data-total="${safeUrls.length}">
+      <img class="gallery-main-image" src="${safeUrls[0]}" alt="Image 1" onerror="this.style.display='none'">
+      <div class="gallery-dots">${dots}</div>
+    </div>
+  `;
+}
+
+function getGalleryImageUrls(gallery) {
+  if (!gallery) return [];
+  if (Array.isArray(gallery.__imageUrls) && gallery.__imageUrls.length) {
+    return gallery.__imageUrls;
+  }
+
+  return Array.from(gallery.querySelectorAll(".gallery-dot"))
+    .map(dot => dot.dataset.url || "")
+    .filter(Boolean);
+}
+
+function setGalleryIndex(gallery, index) {
+  if (!gallery) return;
+
+  const imageUrls = getGalleryImageUrls(gallery);
+  const total = imageUrls.length || Number(gallery.dataset.total || 0);
+  const safeIndex = total > 0 ? ((index % total) + total) % total : 0;
+
+  const mainImage = gallery.querySelector(".gallery-main-image");
+  const dots = gallery.querySelectorAll(".gallery-dot");
+
+  if (mainImage && imageUrls.length) {
+    const imageUrl = imageUrls[safeIndex];
+    mainImage.src = imageUrl;
+    mainImage.alt = `Image ${safeIndex + 1}`;
+    mainImage.style.display = "block";
+  }
+
+  dots.forEach((dot, i) => {
+    dot.classList.toggle("active", i === safeIndex);
+  });
+
+  gallery.dataset.current = String(safeIndex);
+}
+
+function attachGalleryControls(popupElement) {
+  if (!popupElement) return;
+
+  const gallery = popupElement.querySelector(".image-gallery");
+  if (!gallery) return;
+
+  const total = Number(gallery.dataset.total || 0);
+  if (total <= 1) return;
+
+  gallery.__imageUrls = Array.from(gallery.querySelectorAll(".gallery-dot"))
+    .map(dot => dot.dataset.url || "")
+    .filter(Boolean);
+
+  gallery.querySelectorAll(".gallery-dot").forEach(dot => {
+    dot.onclick = () => {
+      setGalleryIndex(gallery, Number(dot.dataset.index || 0));
+    };
+  });
+}
+// ===== PLACE DISPLAY =====
+function showDetails(place) {
+  if (activePlace === place) {
+    activePlace = null;
+
+    if (place.marker) {
+      place.marker.closePopup();
+    }
+
+    return;
+  }
+
+  activePlace = place;
+  const imageUrls = getImagesForPlace(place);
+  console.info(`Showing details for ${place.name} with ${imageUrls.length} valid image URL(s):`, imageUrls);
+
+  if (place.marker) {
+    // Keep the marker centered when opening details
+    if (place.lat != null && place.ing != null) {
+      map.setView([place.lat, place.ing], 17);
+    }
+
+    const directImagesHtml = imageUrls.length
+      ? imageUrls.map(url => `<img src="${url}" class="popup-image" alt="${place.name}" onerror="this.style.display='none'">`).join("")
+      : "";
+
+    const popupContent = `
+      <div class="location-popup">
+        <h3>${place.name}</h3>
+
+        ${buildGalleryHtml(imageUrls) || `<div class="detail-image-stack">${directImagesHtml}</div>`}
+
+        <p>${place.description || ""}</p>
+
+        ${adminMode ? `
+          <button class="popup-edit-btn">Edit</button>
+          <button class="popup-delete-btn">Delete</button>
+        ` : ""}
+      </div>
+    `;
+
+    place.marker.once("popupopen", () => {
+      const popup = place.marker.getPopup().getElement();
+
+      if (!popup) return;
+
+      attachGalleryControls(popup);
+
+      const editBtn = popup.querySelector(".popup-edit-btn");
+      const deleteBtn = popup.querySelector(".popup-delete-btn");
+
+      if (editBtn) {
+        editBtn.addEventListener("click", () => {
+          editLocation(place);
+        });
+      }
+
+      if (deleteBtn) {
+        deleteBtn.addEventListener("click", () => {
+          deleteLocation(place);
+        });
+      }
+    });
+
+    // Register the popup handler before opening it. Leaflet can fire
+    // `popupopen` immediately, so registering afterward leaves the gallery
+    // dots visible but without click handlers.
+    place.marker
+      .bindPopup(popupContent)
+      .openPopup();
+  }
+
+  // Details should only appear in the map popup; the sidebar detail panel stays empty.
+  detailsContainer.innerHTML = "";
+}
+// ===== ADD LOCATION =====
+function startAddLocation() {
+  if (!adminMode) return;
+  document.getElementById("addModal").style.display = "block";
+}
+function startMapPick() {
+  if (!adminMode) return;
+
+  isAdding = true;
+  alert("Click a location on the map.");
+}
+function confirmAdd() {
+  const name = document.getElementById("m_name").value;
+  const lat = parseCoord(document.getElementById("m_lat").value);
+  const ing = parseCoord(document.getElementById("m_ing").value);
+  const desc = document.getElementById("m_desc").value;
+  const img = document.getElementById("m_img").value;
+  const keywordInput = document.getElementById("m_keywords").value;
+
+  const newPlace = normalizePlaceCoordinates({
+    name,
+    lat,
+    ing,
+    description: desc,
+    image: normalizeImageList(img),
+    keyword: keywordInput
+      .split(",")
+      .map(k => k.trim())
+      .filter(k => k !== "")
+  });
+
+ addDoc(collection(db, "places"), newPlace).then(docRef => {
+
+  newPlace.id = docRef.id;
+
+  places.push(newPlace);
+
+  if (!fuse) initFuse();
+  else fuse.setCollection(places);
+
+  renderPlaces(places);
+
+});
+
+// clear add modal fields for next use
+document.getElementById("m_name").value = "";
+document.getElementById("m_lat").value = "";
+document.getElementById("m_ing").value = "";
+document.getElementById("m_desc").value = "";
+document.getElementById("m_img").value = "";
+document.getElementById("m_keywords").value = "";
+
+closeAddModal();
+
+}
+
+function closeAddModal() {
+  document.getElementById("addModal").style.display = "none";
+}
+
+function clearDetails() {
+  detailsContainer.innerHTML = "";
+  activePlace = null;
+}
+// ===== ADMIN EDITING =====
+function editLocation(place) {
+  editingPlace = place;
+
+  document.getElementById("e_name").value = place.name;
+  document.getElementById("e_lat").value = place.lat ?? "";
+  document.getElementById("e_ing").value = place.ing ?? "";
+  document.getElementById("e_desc").value = place.description;
+  document.getElementById("e_img").value = place.image;
+  document.getElementById("e_keywords").value = (place.keyword || []).join(",");
+  document.getElementById("editModal").style.display = "block";
+
+  editingPlace.lat = parseCoord(document.getElementById("e_lat").value);
+  editingPlace.ing = parseCoord(document.getElementById("e_ing").value);
+}
+function confirmEdit() {
+  if (!editingPlace) return;
+
+  editingPlace.name = document.getElementById("e_name").value;
+  editingPlace.lat = parseCoord(document.getElementById("e_lat").value);
+  editingPlace.ing = parseCoord(document.getElementById("e_ing").value);
+  editingPlace.latString = editingPlace.lat != null ? String(editingPlace.lat) : "";
+  editingPlace.ingString = editingPlace.ing != null ? String(editingPlace.ing) : "";
+  editingPlace.description = document.getElementById("e_desc").value;
+  editingPlace.image = normalizeImageList(document.getElementById("e_img").value);
+
+  editingPlace.keyword = document
+    .getElementById("e_keywords")
+    .value
+    .split(",")
+    .map(k => k.trim())
+    .filter(k => k !== "");
+
+  updateDoc(doc(db, "places", editingPlace.id), {
+    name: editingPlace.name,
+    lat: editingPlace.lat,
+    ing: editingPlace.ing,
+    description: editingPlace.description,
+    image: editingPlace.image,
+    keyword: editingPlace.keyword
+  }).then(() => {
+    loadPlaces();
+  });
+
+  closeEditModal();
+}
+function closeEditModal() {
+  document.getElementById("editModal").style.display = "none";
+}
+function deleteLocation(place) {
+  deleteDoc(doc(db, "places", place.id)).then(() => {
+    loadPlaces();
+  });
+}
+
+function updateUI() {
+  const addBtn = document.getElementById("addBtn");
+  const excelFile = document.getElementById("excelFile");
+  const modal = document.getElementById("addModal");
+  const loginForm = document.getElementById("loginForm");
+  const passwordInput = document.getElementById("password");
+
+  if (addBtn) addBtn.style.display = adminMode ? "inline-block" : "none";
+  if (excelFile) excelFile.style.display = adminMode ? "block" : "none";
+  if (excelFile) excelFile.disabled = !adminMode;
+
+  if (loginForm) loginForm.style.display = adminMode ? "none" : "block";
+  document.getElementById("logoutBtn").style.display =
+    adminMode ? "inline-block" : "none";
+
+  if (!adminMode && modal) {
+    modal.style.display = "none"; // 🔥 prevents stuck modal
+  }
+
+  if (passwordInput && !adminMode) {
+    passwordInput.value = "";
+  }
+
+  if (addBtn) addBtn.onclick = startAddLocation;
+  
+  const pickMapBtn = document.getElementById("pickMapBtn");
+
+  if (pickMapBtn) {
+    pickMapBtn.style.display =
+      adminMode ? "inline-block" : "none";
+
+    pickMapBtn.onclick = startMapPick;
+  }
+}
+
+function renderPlaces(list) {
+  console.log(
+    "renderPlaces called with:",
+    Array.isArray(list) ? list.length : typeof list,
+    "places"
+  );
+
+  console.log("📋 places currently contains:", places.length);
+
+  // Always sort the visible list alphabetically
+  list = [...list].sort((a, b) =>
+    String(a.name || "").localeCompare(
+      String(b.name || ""),
+      "nl",
+      {
+        sensitivity: "base",
+        numeric: true
+      }
+    )
+  );
+
+  console.log("🔤 SORTED LIST:", list.map(place => place.name));
+
+  listContainer.innerHTML = "";
+
+  markers.forEach(m => map.removeLayer(m));
+  markers = [];
+
+  list.forEach(place => {
+
+    // Add to list first
+    const item = document.createElement("div");
+    item.textContent = place.name;
+    item.onclick = () => showDetails(place);
+    listContainer.appendChild(item);
+
+    // Only skip marker creation if coordinates are missing
+    const lat = parseCoord(place.lat);
+    const ing = parseCoord(place.ing);
+
+    if (!Number.isFinite(lat) || !Number.isFinite(ing)) {
+      console.warn("Skipping invalid marker coordinates:", place.name, {
+        lat: place.lat,
+        ing: place.ing,
+        parsedLat: lat,
+        parsedIng: ing
+      });
+      return;
+    }
+
+    const marker = L.marker([lat, ing]).addTo(map);
+    place.marker = marker;
+    marker.on("click", () => showDetails(place));
+
+    markers.push(marker);
+  });
+}
+
+// ===== SEARCH =====
+function searchPlaces(query) {
+  const text = query.trim();
+  if (!text) {
+    return renderPlaces(places);
+  }
+
+  const coordinateMatch = text.match(/^(-?\d+(?:[.,]\d+)?)\s*[ ,]\s*(-?\d+(?:[.,]\d+)?)$/);
+  if (coordinateMatch) {
+    const lat = parseCoord(coordinateMatch[1]);
+    const ing = parseCoord(coordinateMatch[2]);
+
+    if (lat != null && ing != null) {
+      const exactMatches = places.filter(place => {
+        const plat = parseCoord(place.lat);
+        const ping = parseCoord(place.ing);
+        return plat != null && ping != null && Math.abs(plat - lat) < 0.000001 && Math.abs(ping - ing) < 0.000001;
+      });
+
+      if (exactMatches.length) {
+        return renderPlaces(exactMatches);
+      }
+
+      let closest = null;
+      let minDistance = Infinity;
+      places.forEach(place => {
+        const plat = parseCoord(place.lat);
+        const ping = parseCoord(place.ing);
+        if (plat == null || ping == null) return;
+        const distance = (plat - lat) ** 2 + (ping - ing) ** 2;
+        if (distance < minDistance) {
+          minDistance = distance;
+          closest = place;
+        }
+      });
+
+      if (closest) {
+        return renderPlaces([closest]);
+      }
+    }
+  }
+
+  if (!fuse) {
+    initFuse();
+  }
+
+  const result = fuse.search(text);
+  renderPlaces(result.map(r => r.item));
+}
+
+searchInput.addEventListener("input", () => {
+  searchPlaces(searchInput.value);
+});
+// ===== LOGIN SYSTEM =====
+
+async function login() {
+  const password = document.getElementById("password").value;
+
+  try {
+    await signInWithEmailAndPassword(
+      auth,
+      "juno.denis2008@gmail.com",
+      password
+    );
+
+    adminMode = true;
+    updateUI();
+
+  } catch (error) {
+
+    console.error("Firebase login error:", error);
+    alert("Onjuist wachtwoord.");
+
+  }
+
+}
+async function logout() {
+  await signOut(auth);
+  adminMode = false;
+  updateUI();
+}
+
+async function uploadImageToSupabase(image) {
+  if (!auth.currentUser) {
+    throw new Error("Sign in with the Firebase admin account before uploading pictures.");
+  }
+  if (SUPABASE_PUBLISHABLE_KEY === "PASTE_SUPABASE_PUBLISHABLE_KEY_HERE") {
+    throw new Error("Set SUPABASE_PUBLISHABLE_KEY in javascript.js to the Supabase publishable key.");
+  }
+
+  const filePath = `places/${crypto.randomUUID()}-${image.name}`;
+  const { data, error } = await supabase.storage
+    .from(SUPABASE_BUCKET)
+    .upload(filePath, image.blob, {
+      contentType: image.blob.type || "application/octet-stream"
+    });
+
+  if (error) throw error;
+
+  const { data: { publicUrl } } = supabase.storage
+    .from(SUPABASE_BUCKET)
+    .getPublicUrl(data.path);
+
+  return publicUrl;
+}
+
+function normalizeAddressKey(address) {
+  return String(address || "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+window.addEventListener("load", () => {
+  const excelFileInput = document.getElementById("excelFile");
+  if (!excelFileInput) return;
+
+  excelFileInput.addEventListener("change", event => {
+    if (!adminMode) return;
+
+    const file = event.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = async loadEvent => {
+      isImporting = true;
+      let successCount = 0;
+      let errorCount = 0;
+      let imageErrorCount = 0;
+      let firestoreSaveErrorCount = 0;
+      let matchedImageCount = 0;
+      let extractedImageCount = null;
+
+      try {
+        const workbookBytes = new Uint8Array(loadEvent.target.result);
+        const workbook = XLSX.read(workbookBytes, { type: "array" });
+        const firstSheetName = workbook.SheetNames[0];
+        const sheet = workbook.Sheets[firstSheetName];
+        const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+        const sheetRowOffset = sheet["!ref"]
+          ? XLSX.utils.decode_range(sheet["!ref"]).s.r
+          : 0;
+        const headerNames = (rows[0] || []).map(value => String(value).trim().toLowerCase());
+        const hasHeader = ["name", "address", "adres", "naam"].includes(headerNames[0]);
+        const firstDataRow = hasHeader ? 1 : 0;
+        let imagesByRow;
+        try {
+          imagesByRow = await window.extractWorkbookImages(workbookBytes, firstSheetName);
+        } catch (extractionError) {
+          throw new Error(`Excel picture extraction failed: ${extractionError.message}`);
+        }
+        extractedImageCount = Array.from(imagesByRow.values())
+          .reduce((total, rowImages) => total + rowImages.length, 0);
+        if (!extractedImageCount) {
+          console.warn("No embedded pictures were extracted. Check that the workbook contains pictures anchored to the first worksheet.");
+        }
+        const existingSnapshot = await getDocs(collection(db, "places"));
+        const existingPlaces = new Map();
+
+        existingSnapshot.docs.forEach(docSnap => {
+          const data = docSnap.data();
+          if (data.name) {
+            existingPlaces.set(normalizeAddressKey(data.name), {
+              id: docSnap.id,
+              image: sanitizeImageArray(data.image || data.images || data.img || "")
+            });
+          }
+        });
+
+        for (let rowNumber = firstDataRow; rowNumber < rows.length; rowNumber++) {
+          const cells = rows[rowNumber] || [];
+          const address = String(cells[0] || "").trim();
+          if (!address) continue;
+
+          const row = {};
+          if (hasHeader) {
+            headerNames.forEach((header, columnIndex) => {
+              if (header) row[header] = cells[columnIndex];
+            });
+          }
+          row.name = address;
+
+          try {
+            let coordinates = extractLatLngFromRow(row);
+            if (coordinates.lat == null || coordinates.ing == null) {
+              const geocoded = await geocodeAddress(address);
+              if (geocoded) coordinates = geocoded;
+            }
+
+            const imageUrls = [];
+            const worksheetRow = rowNumber + sheetRowOffset;
+            const rowImages = imagesByRow.get(worksheetRow) || [];
+            matchedImageCount += rowImages.length;
+            if (rowImages.length) {
+              console.info(`Mapped ${rowImages.length} workbook image(s) from worksheet row ${worksheetRow + 1} to ${address}.`);
+            }
+            for (const picture of rowImages) {
+              try {
+                const publicUrl = await uploadImageToSupabase(picture);
+                imageUrls.push(publicUrl);
+                console.info(`✅ Upload succeeded for ${address}: ${picture.name} -> ${publicUrl}`);
+              } catch (uploadError) {
+                imageErrorCount++;
+                console.error(`❌ Supabase upload failed for ${address} (${picture.name}):`, uploadError);
+              }
+            }
+
+            const descriptionKey = headerNames.find(header => ["description", "beschrijving", "omschrijving"].includes(header));
+            const place = {
+              name: address,
+              keyword: [],
+              description: descriptionKey ? row[descriptionKey] || "" : "",
+              lat: parseCoord(coordinates.lat),
+              ing: parseCoord(coordinates.ing)
+            };
+            const normalizedAddress = normalizeAddressKey(address);
+            const existingPlace = existingPlaces.get(normalizedAddress);
+            const existingImages = sanitizeImageArray(existingPlace ? existingPlace.image : []);
+            const mergedImages = [...new Set([...existingImages, ...imageUrls])];
+
+            if (existingPlace) {
+              place.image = mergedImages;
+            } else {
+              place.image = imageUrls;
+            }
+
+            try {
+              if (existingPlace) {
+                await updateDoc(doc(db, "places", existingPlace.id), place);
+                existingPlace.image = place.image;
+                console.info(`✅ Saved ${place.image.length} image URL(s) to Firestore for ${address}: ${place.image.join(", ")}`);
+              } else {
+                const docRef = await addDoc(collection(db, "places"), place);
+                existingPlaces.set(normalizedAddress, { id: docRef.id, image: place.image });
+                console.info(`✅ Added new Firestore place ${address} with ${place.image.length} image URL(s): ${place.image.join(", ")}`);
+              }
+            } catch (saveError) {
+              errorCount++;
+              firestoreSaveErrorCount++;
+              console.error(`❌ Firestore save failed for ${address}:`, saveError);
+              continue;
+            }
+
+            if (imageUrls.length === 0) {
+              console.warn(`⚠️ No valid image URL(s) were uploaded for ${address}; the place was still saved without new photos.`);
+            }
+
+            successCount++;
+          } catch (error) {
+            errorCount++;
+            console.error(`Import failed for ${address}:`, error);
+          }
+        }
+
+        await removeDuplicatePlaces();
+      } catch (error) {
+        errorCount++;
+        console.error("Workbook import failed:", error);
+        alert(`Workbook import failed: ${error.message}`);
+      } finally {
+        isImporting = false;
+        await loadPlaces();
+        excelFileInput.value = "";
+        console.log(`Import complete. Extracted pictures: ${typeof extractedImageCount === "number" ? extractedImageCount : "unavailable"}; matched workbook images: ${matchedImageCount}; places saved: ${successCount}; row/save errors: ${errorCount}; Firestore save errors: ${firestoreSaveErrorCount}; upload errors: ${imageErrorCount}.`);
+        const importWarnings = [];
+        if (typeof extractedImageCount === "number" && extractedImageCount === 0) {
+          importWarnings.push("No embedded pictures were extracted from the first worksheet.");
+        } else if (typeof extractedImageCount === "number" && matchedImageCount < extractedImageCount) {
+          importWarnings.push(`${extractedImageCount - matchedImageCount} extracted picture(s) did not match a non-empty address row.`);
+        }
+        if (imageErrorCount) {
+          importWarnings.push(`${imageErrorCount} picture upload(s) failed; existing images were kept.`);
+        }
+        if (firestoreSaveErrorCount) {
+          importWarnings.push(`${firestoreSaveErrorCount} Firestore save(s) failed. See the browser console for the affected addresses and errors.`);
+        }
+        if (successCount) {
+          console.info(`✅ Excel import finished: ${successCount} address row(s) saved successfully.`);
+        }
+        if (imageErrorCount || firestoreSaveErrorCount || importWarnings.length) {
+          alert(`Imported ${successCount} address row(s). ${importWarnings.join(" ")}`);
+        }
+      }
+    };
+
+    reader.readAsArrayBuffer(file);
+  });
+});
+ 
+// ===== INIT =====
+window.addEventListener("load", () => {
+  console.log("Page loaded - initializing app");
+  loadPlaces();
+  updateUI();
+
+  setTimeout(() => {
+    map.invalidateSize();
+  }, 100);
+});
+
+// ===== EXCEL GEOCODING IMPORT (moved from app.js into javascript.js)
+// Uses the existing `excelFile` input and the same Leaflet `map` instance.
+let excelMarkers = [];
+let excelBounds = L.latLngBounds();
+
+function clearExcelMarkers() {
+  excelMarkers.forEach(m => map.removeLayer(m));
+  excelMarkers = [];
+  excelBounds = L.latLngBounds();
+}
+
+async function geocodeAddress(address) {
+  const searchAddress = address;
+  const encodedAddress = encodeURIComponent(searchAddress);
+
+  const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&q=${encodedAddress}&countrycodes=be&limit=1`;
+
+  try {
+    // Wait 1 second before each request to respect Nominatim's rate limit
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      throw new Error(`Geocoding request failed: ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    if (data.length === 0) {
+      console.warn("No coordinates found for:", address);
+      return null;
+    }
+
+    return {
+      lat: parseFloat(data[0].lat),
+      ing: parseFloat(data[0].lon)
+    };
+
+  } catch (error) {
+    console.error("Geocoding failed for:", address, error);
+    return null;
+  }
+}
+// After getting Nominatim results, validate the city matches
+function validateGeocodeResult(results, expectedCity) {
+  // Try to find a result where display_name contains the expected city
+  const match = results.find(r => 
+    r.display_name.toLowerCase().includes(expectedCity.toLowerCase())
+  );
+  
+  if (match) return match;
+  
+  // If no match, try with postal code or bounded search
+  // (fallback strategy)
+  return null;
+}
+
+window.confirmAdd = confirmAdd;
+window.closeAddModal = closeAddModal;
+window.confirmEdit = confirmEdit;
+window.closeEditModal = closeEditModal;
+window.login = login;
+window.logout = logout;
+
+const sidebar = document.getElementById("sidebar");
+const toggleSidebar = document.getElementById("toggle-sidebar");
+
+toggleSidebar.addEventListener("click", () => {
+    const isCollapsed = sidebar.classList.toggle("collapsed");
+
+    toggleSidebar.textContent = isCollapsed ? "▶" : "◀";
+    toggleSidebar.setAttribute("aria-expanded", String(!isCollapsed));
+    toggleSidebar.setAttribute(
+        "aria-label",
+        isCollapsed ? "Menu openen" : "Menu verbergen"
+    );
+
+    if (window.innerWidth > 480) {
+        toggleSidebar.style.left = isCollapsed ? "0" : "250px";
+    }
+});
